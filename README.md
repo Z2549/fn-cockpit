@@ -67,12 +67,21 @@
 ## 开发
 
 ```bash
-# 打包（飞牛官方 fnpack）
+# 打包（飞牛官方 fnpack；tools/build.sh 只打包 fpk 标准成员，避免混入仓库文件）
 fnpack build -d native-ui-application-sample
+# 或：FNPACK=/path/to/fnpack bash tools/build.sh
 
 # 本地回归测试（无需 NAS）
 python tests/test_relay.py
 ```
+
+## CI（GitHub Actions）
+
+仓库自带 `.github/workflows/ci.yml`：
+
+- **push / PR**：shell & Python 语法检查 → relay 回归测试 → 用官方 fnpack 1.2.3（Linux 版）构建 fpk → 包体纯净性校验 → 产物上传 Actions Artifacts
+- **PR 自动审阅**：汇总上述检查结果自动评论到 PR；若仓库配置了 `AI_API_KEY` secret（默认 DeepSeek API，可在 workflow 中换端点），还会拉取 PR diff 生成 AI 审阅意见
+- **发布 Release**：自动构建并把 fpk 附加到 Release（无需手动上传）
 
 ## License
 

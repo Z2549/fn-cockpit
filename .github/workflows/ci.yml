@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    name: 测试与语法检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 生命周期脚本 shell 语法检查
+        run: |
+          set -e
+          for f in cmd/*; do
+            bash -n "$f" && echo "OK  $f"
+          done
+      - name: Python 编译检查
+        run: python -m py_compile app/server/relay.py app/server/precheck.py && echo "OK  python"
+      - name: relay 回归测试
+        run: |
+          python tests/test_relay.py 2>&1 | tee /tmp/test_out.txt
+          grep -q "WS tunnel" /tmp/test_out.txt
+
+  build:
+    name: 构建 fpk
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 fnpack（飞牛官方打包器，固定 1.2.3）
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/fnpack" \
+            https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod +x "$HOME/.local/bin/fnpack"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: 构建（只打包 fpk 标准成员）
+        run: bash tools/build.sh
+      - name: 包体纯净性校验（不得混入 README/LICENSE/tests）
+        run: |
+          python - <<'PY'
+          import glob, tarfile, sys
+          f = glob.glob('out/*.fpk')[0]
+          names = tarfile.open(f).getnames()
+          bad = [n for n in names if n in ('LICENSE', 'README.md') or n.endswith('.pyc')]
+          inner = tarfile.open(glob.glob('out/*.fpk')[0]).extractfile('app.tgz').read()
+          import io
+          inames = tarfile.open(fileobj=io.BytesIO(inner)).getnames()
+          ibad = [n for n in inames if '__pycache__' in n or n.endswith('.pyc')]
+          assert not bad and not ibad, f'污染: {bad} {ibad}'
+          print(f'纯净 OK: {f} 外层 {len(names)} 成员 / 内层 {len(inames)} 成员')
+          PY
+      - name: 记录版本号
+        run: echo "VER=$(grep -E '^version' manifest | sed 's/[^0-9.]//g')" >> "$GITHUB_OUTPUT"
+        id: ver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fpk
+          path: out/*.fpk
+
+  attach-release:
+    name: 附件到 Release
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fpk
+          path: out
+      - name: 上传 fpk 到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" out/*.fpk --clobber --repo "$GITHUB_REPOSITORY"
+
+  review:
+    name: PR 自动审阅
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    env:
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 汇总校验结论并评论
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const testR = '${{ needs.test.result }}';
+            const buildR = '${{ needs.build.result }}';
+            const mark = r => (r === 'success' ? '✅ 通过' : '❌ 失败');
+            const ver = require('fs')
+              .readFileSync('manifest', 'utf8')
+              .match(/^version\s*=\s*"?([\d.]+)"?/m)?.[1] || '?';
+            const body = [
+              `## 🤖 CI 自动审阅`,
+              ``,
+              `| 检查项 | 结果 |`,
+              `|---|---|`,
+              `| shell / python 语法 + relay 回归测试 | ${mark(testR)} |`,
+              `| fpk 构建（fnpack 1.2.3） | ${mark(buildR)} |`,
+              `| 构建产物 | fn-cockpit-v${ver}.fpk（见 Actions Artifacts） |`,
+              ``,
+              testR === 'success' && buildR === 'success'
+                ? '所有自动化检查通过。'
+                : '⚠️ 存在失败项，请查看 Actions 日志修复后重推。',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+      - name: AI 代码审阅（配置 AI_API_KEY secret 后启用）
+        if: env.AI_API_KEY != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.diff" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$PR" -o /tmp/pr.diff
+          DIFF_SIZE=$(wc -c < /tmp/pr.diff)
+          if [ "$DIFF_SIZE" -gt 120000 ]; then
+            head -c 120000 /tmp/pr.diff > /tmp/pr_trimmed.diff
+            mv /tmp/pr_trimmed.diff /tmp/pr.diff
+          fi
+          python - <<'PY'
+          import json, os, urllib.request
+          diff = open('/tmp/pr.diff', encoding='utf-8', errors='replace').read()
+          prompt = (
+              '你是资深 fnOS/嵌入式 Linux 工程师，审阅这个飞牛 fpk 应用的 PR diff。'
+              '重点：lifecycle 脚本安全性（禁止 set -e、root 权限操作幂等性）、'
+              'python 中继的 HTTP/WS 正确性、systemd socket 配置、是否有硬编码路径/用户名。'
+              '用简体中文输出 markdown：先给「结论：可合并/需修改」，再列问题（严重级别）与建议。'
+              '没有问题就简短说明。'
+          )
+          req = urllib.request.Request(
+              'https://api.deepseek.com/chat/completions',
+              data=json.dumps({
+                  'model': 'deepseek-chat',
+                  'messages': [
+                      {'role': 'system', 'content': prompt},
+                      {'role': 'user', 'content': f'PR diff:\n```diff\n{diff}\n```'},
+                  ],
+                  'temperature': 0.2,
+              }).encode(),
+              headers={
+                  'Authorization': 'Bearer ' + os.environ['AI_API_KEY'],
+                  'Content-Type': 'application/json',
+              })
+          with urllib.request.urlopen(req, timeout=180) as r:
+              out = json.load(r)
+          review = out['choices'][0]['message']['content']
+          open('/tmp/review.md', 'w', encoding='utf-8').write(
+              '## 🔍 AI 审阅意见\n\n' + review + '\n\n'
+              '> AI 意见仅供参考，合并决策请结合 CI 检查结果与人工判断。')
+          PY
+          gh pr comment "$PR" --body-file /tmp/review.md
