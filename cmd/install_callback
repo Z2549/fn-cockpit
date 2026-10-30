@@ -1,0 +1,57 @@
+#!/bin/bash
+# fn-cockpit - 安装后：生成 drop-in(cockpit.sock)、主 cockpit.conf(UrlRoot)，接入飞牛网关
+# v0.1.2: conf 写主文件（Debian 12 cockpit 287 不支持 cockpit.conf.d）；cockpit 监听 cockpit.sock，由 relay 对接网关
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APPNAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/var/apps/${APPNAME}/var}"
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-install.log}"
+GATEWAY_PREFIX="/app/${APPNAME}"
+CONF_BEGIN="# fn-cockpit-managed-BEGIN"
+CONF_END="# fn-cockpit-managed-END"
+
+{
+    echo "[${APPNAME}] install_callback: start"
+    echo "[${APPNAME}] APPDEST=${APPDEST}"
+
+    mkdir -p "$PKGVAR" /etc/systemd/system/cockpit.socket.d /etc/cockpit
+
+    # 1) drop-in：cockpit 监听应用目录 cockpit.sock（relay 再对网关提供 app.sock）
+    cat > /etc/systemd/system/cockpit.socket.d/fn-cockpit.conf <<EOF
+# Managed by fn-cockpit fpk. Do NOT edit by hand; reinstall or edit then: systemctl daemon-reload
+[Socket]
+ListenStream=
+ListenStream=${APPDEST}/cockpit.sock
+SocketMode=0666
+EOF
+    echo "[${APPNAME}] drop-in -> ${APPDEST}/cockpit.sock"
+
+    # 2) 主 cockpit.conf：UrlRoot 对齐网关前缀（幂等写法：标记段替换）
+    CONF=/etc/cockpit/cockpit.conf
+    [ -f "$CONF" ] || : > "$CONF"
+    if [ ! -f "${CONF}.fn-cockpit-orig" ]; then
+        cp -n "$CONF" "${CONF}.fn-cockpit-orig" 2>/dev/null || true
+    fi
+    sed -i "/^${CONF_BEGIN}$/,/^${CONF_END}$/d" "$CONF" 2>/dev/null || true
+    cat >> "$CONF" <<EOF
+${CONF_BEGIN}
+[WebService]
+UrlRoot = ${GATEWAY_PREFIX}
+LoginTitle = ${APPNAME}
+ProtocolHeader = X-Forwarded-Proto
+ForwardedForHeader = X-Forwarded-For
+AllowUnencrypted = true
+# v0.1.7 起 relay 会把 Origin 重写为 https://<Host>，一般无需再配 Origins
+# Origins = https://192.168.31.182:5667
+${CONF_END}
+EOF
+    echo "[${APPNAME}] cockpit.conf UrlRoot=${GATEWAY_PREFIX} written"
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 3) 清理残留，确保 main start 干净启动
+    rm -f "${APPDEST}/app.sock" "${APPDEST}/cockpit.sock" 2>/dev/null
+    chmod +x "${APPDEST%/target}/cmd/main" 2>/dev/null
+
+    echo "[${APPNAME}] install_callback: done"
+} >> "$LOG" 2>&1
+exit 0

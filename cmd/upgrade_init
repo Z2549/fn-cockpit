@@ -1,0 +1,17 @@
+#!/bin/bash
+# fn-cockpit - 升级前：确保 cockpit 仍在（幂等，已装则直接通过）
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+LOGTMP() { [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "[${APPNAME}] $*" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null; return 0; }
+
+if dpkg -s cockpit >/dev/null 2>&1; then
+    echo "[${APPNAME}] cockpit present"
+    exit 0
+fi
+
+echo "[${APPNAME}] cockpit missing, reinstalling via apt ..."
+apt-get update -qq >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>&1 || true
+if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cockpit >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>&1; then
+    exit 0
+fi
+LOGTMP "升级时 apt 安装 cockpit 失败"
+exit 1

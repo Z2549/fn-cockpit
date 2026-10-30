@@ -1,0 +1,54 @@
+#!/bin/bash
+# fn-cockpit - 安装前：确保宿主机 Cockpit 完整安装（Debian 官方源）
+# v0.1.1: 处理中断导致的半装状态；装后强校验 unit 文件存在
+# 由飞牛 appcenter 以 root 调用。失败 exit 1 会中止安装。
+
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+TLOG="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-install.log}"
+LOGTMP() { [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "[${APPNAME}] $*" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null; return 0; }
+
+echo "[${APPNAME}] install_init: start"
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[${APPNAME}] ERROR: apt-get not found" >&2
+    LOGTMP "系统缺少 apt-get，无法安装 Cockpit"
+    exit 1
+fi
+
+# 0) 修复可能存在的半装状态（上次安装被中断）
+if dpkg -s cockpit >/dev/null 2>&1 || dpkg -s cockpit-ws >/dev/null 2>&1; then
+    echo "[${APPNAME}] repairing possibly broken dpkg state ..."
+    echo "[${APPNAME}] dpkg --configure -a ..." >> "$TLOG" 2>&1
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >> "$TLOG" 2>&1 || true
+fi
+
+# 1) 已完整安装则直接通过（cockpit-ws 提供 cockpit.socket unit 文件）
+pkg_ok() { dpkg-query -W -f='${Status} ${Version}' "$1" 2>/dev/null | grep -q "^install ok installed"; }
+if pkg_ok cockpit && pkg_ok cockpit-ws && [ -f /lib/systemd/system/cockpit.socket ]; then
+    echo "[${APPNAME}] cockpit fully installed: $(dpkg-query -W -f='${Version}' cockpit 2>/dev/null)"
+    LOGTMP "cockpit 已完整安装，复用"
+    exit 0
+fi
+
+# 2) 安装/补全
+echo "[${APPNAME}] apt-get update (quiet) ..."
+apt-get update -qq >> "$TLOG" 2>&1 || echo "[${APPNAME}] WARN: apt-get update nonzero" >&2
+
+echo "[${APPNAME}] installing cockpit (this may take a minute) ..."
+if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cockpit >> "$TLOG" 2>&1; then
+    echo "[${APPNAME}] ERROR: apt-get install cockpit failed" >&2
+    LOGTMP "apt 安装 cockpit 失败：请确认 NAS 可访问 Debian 软件源后重试"
+    tail -8 "$TLOG" 2>/dev/null | while read -r l; do echo "[${APPNAME}]   | $l"; done
+    exit 1
+fi
+
+# 3) 装后强校验
+pkg_ok cockpit && pkg_ok cockpit-ws && [ -f /lib/systemd/system/cockpit.socket ] || {
+    echo "[${APPNAME}] ERROR: cockpit packages incomplete after install" >&2
+    LOGTMP "cockpit 安装不完整（unit 文件缺失），请重试安装"
+    dpkg -l 'cockpit*' 2>&1 | while read -r l; do echo "[${APPNAME}]   | $l"; done
+    exit 1
+}
+
+echo "[${APPNAME}] cockpit installed OK: $(dpkg-query -W -f='${Version}' cockpit 2>/dev/null)"
+exit 0

@@ -1,0 +1,235 @@
+#!/bin/bash
+# fn-cockpit - 生命周期主脚本 v0.1.2：start/stop/status/restart/uninstall
+#
+# 架构（v0.1.2 起加入 relay，解决"网关剥前缀 + cockpit 需要 UrlRoot"的错位）：
+#   浏览器 /app/fn-cockpit/* -> 飞牛网关(剥前缀) -> app.sock
+#     -> relay.py(补前缀+X-Forwarded-Proto+WS盲转) -> cockpit.sock
+#     -> cockpit-ws (systemd socket activation, UrlRoot=/app/fn-cockpit)
+#
+# 注意：不使用 set -e；单条命令失败记日志后继续，避免 appcenter 报错。
+
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APPNAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/var/apps/${APPNAME}/var}"
+LOGFILE="${PKGVAR}/service.log"
+GATEWAY_PREFIX="/app/${APPNAME}"
+DROPIN="/etc/systemd/system/cockpit.socket.d/fn-cockpit.conf"
+COCKPIT_SOCK="${APPDEST}/cockpit.sock"   # cockpit.socket 监听（systemd）
+APP_SOCK="${APPDEST}/app.sock"           # relay 监听（网关目标）
+RELAY="${APPDEST}/server/relay.py"
+PIDFILE="${PKGVAR}/relay.pid"
+CONF_BEGIN="# fn-cockpit-managed-BEGIN"
+CONF_END="# fn-cockpit-managed-END"
+
+log()  { echo "[${APPNAME}] $(date '+%F %T') $*" >> "${LOGFILE}" 2>/dev/null; echo "[${APPNAME}] $*"; }
+logtmp() { [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "[${APPNAME}] $*" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null; return 0; }
+
+find_python() {
+    export PATH="/var/apps/python312/target/bin:${PATH}"
+    for candidate in python3.12 python3.11 python3.10 python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 失败诊断：关键状态全进 service.log
+dump_debug() {
+    log "---- DEBUG DUMP BEGIN ----"
+    log "APPDEST=${APPDEST}"
+    log "COCKPIT_SOCK=${COCKPIT_SOCK}  APP_SOCK=${APP_SOCK}"
+    log "drop-in ($DROPIN):"
+    cat "$DROPIN" 2>&1 | while IFS= read -r l; do log "  | $l"; done
+    log "cockpit.conf managed section:"
+    sed -n "/^${CONF_BEGIN}$/,/^${CONF_END}$/p" /etc/cockpit/cockpit.conf 2>&1 | while IFS= read -r l; do log "  | $l"; done
+    log "systemctl status cockpit.socket:"
+    systemctl status cockpit.socket --no-pager -l 2>&1 | head -12 | while IFS= read -r l; do log "  | $l"; done
+    log "effective ListenStream:"
+    systemctl show cockpit.socket -p ListenStream --no-pager 2>&1 | while IFS= read -r l; do log "  | $l"; done
+    log "journalctl cockpit.socket (last 12):"
+    journalctl -u cockpit.socket -n 12 --no-pager 2>&1 | tail -12 | while IFS= read -r l; do log "  | $l"; done
+    log "relay.log tail:"
+    tail -20 "${PKGVAR}/relay.log" 2>&1 | while IFS= read -r l; do log "  | $l"; done
+    log "---- DEBUG DUMP END ----"
+}
+
+# 幂等写 cockpit.socket drop-in：cockpit 侧监听 cockpit.sock（不再直接对网关）
+write_dropin() {
+    mkdir -p /etc/systemd/system/cockpit.socket.d
+    cat > "$DROPIN" <<EOF
+# Managed by fn-cockpit fpk. Do NOT edit by hand; reinstall or edit then: systemctl daemon-reload
+[Socket]
+ListenStream=
+ListenStream=${COCKPIT_SOCK}
+SocketMode=0666
+EOF
+}
+
+# 幂等写主 cockpit.conf（Debian 12 cockpit 287 不支持 cockpit.conf.d，必须写主文件）
+write_cockpit_conf() {
+    local CONF=/etc/cockpit/cockpit.conf
+    mkdir -p /etc/cockpit
+    [ -f "$CONF" ] || : > "$CONF"
+    if [ ! -f "${CONF}.fn-cockpit-orig" ]; then
+        cp -n "$CONF" "${CONF}.fn-cockpit-orig" 2>/dev/null || true
+    fi
+    # 删除旧的受管段（幂等）
+    sed -i "/^${CONF_BEGIN}$/,/^${CONF_END}$/d" "$CONF" 2>/dev/null || true
+    cat >> "$CONF" <<EOF
+${CONF_BEGIN}
+[WebService]
+UrlRoot = ${GATEWAY_PREFIX}
+LoginTitle = ${APPNAME}
+ProtocolHeader = X-Forwarded-Proto
+ForwardedForHeader = X-Forwarded-For
+AllowUnencrypted = true
+# v0.1.7 起 relay 会把 Origin 重写为 https://<Host>，一般无需再配 Origins；
+# 若直连 cockpit.sock 的场景出现 bad Origin，再取消下一行注释
+# Origins = https://192.168.31.182:5667
+${CONF_END}
+EOF
+}
+
+ensure_config() {
+    mkdir -p "${PKGVAR}" /etc/systemd/system/cockpit.socket.d /etc/cockpit
+    write_dropin
+    write_cockpit_conf
+    if ! systemctl daemon-reload 2>> "${LOGFILE}"; then
+        log "WARN: systemctl daemon-reload failed"
+    fi
+}
+
+pkg_complete() {
+    dpkg-query -W -f='${Status}' cockpit 2>/dev/null | grep -q "install ok installed" \
+      && dpkg-query -W -f='${Status}' cockpit-ws 2>/dev/null | grep -q "install ok installed" \
+      && [ -f /lib/systemd/system/cockpit.socket ]
+}
+
+relay_running() {
+    [ -f "$PIDFILE" ] || return 1
+    kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+socket_ready() {
+    [ -S "$APP_SOCK" ] && relay_running && systemctl is-active cockpit.socket >/dev/null 2>&1
+}
+
+start_service() {
+    if socket_ready; then
+        log "already running (relay + cockpit.socket)"
+        return 0
+    fi
+    if ! pkg_complete; then
+        log "ERROR: cockpit packages incomplete; reinstall the app"
+        dpkg -l 'cockpit*' 2>&1 | while IFS= read -r l; do log "  | $l"; done
+        logtmp "cockpit 未完整安装：请卸载本应用后重新安装"
+        return 1
+    fi
+    log "ensuring config ..."
+    ensure_config
+
+    # 1) cockpit.socket -> cockpit.sock
+    rm -f "$COCKPIT_SOCK" "$APP_SOCK" 2>/dev/null
+    if ! systemctl enable --now cockpit.socket >> "$LOGFILE" 2>&1; then
+        log "ERROR: systemctl enable --now cockpit.socket failed"
+        dump_debug
+        logtmp "cockpit.socket 启动失败，详见 service.log"
+        return 1
+    fi
+    for _ in $(seq 1 20); do
+        [ -S "$COCKPIT_SOCK" ] && break
+        sleep 0.5
+    done
+    if [ ! -S "$COCKPIT_SOCK" ]; then
+        log "ERROR: cockpit.sock not ready after 10s"
+        dump_debug
+        logtmp "cockpit.sock 未就绪，详见 service.log"
+        return 1
+    fi
+    log "cockpit.socket active: $COCKPIT_SOCK"
+
+    # 直连预检 v0.1.4：不经网关，直接对 cockpit.sock 发请求验证 cockpit-ws 健康状况
+    PYTHON_CHECK="$(find_python)"
+    if [ -n "$PYTHON_CHECK" ] && [ -f "${APPDEST}/server/precheck.py" ]; then
+        PRECHECK="$(TRIM_APPDEST="$APPDEST" TRIM_APPNAME="$APPNAME" "$PYTHON_CHECK" "${APPDEST}/server/precheck.py" 2>&1)"
+        log "cockpit precheck: $PRECHECK"
+        case "$PRECHECK" in
+            OK:*) : ;;
+            *)
+                log "WARN: cockpit direct precheck failed - cockpit-ws may be unhealthy"
+                journalctl -u cockpit.service -n 25 --no-pager >> "$LOGFILE" 2>&1
+                ;;
+        esac
+    fi
+
+    # 2) relay -> app.sock
+    if relay_running; then
+        log "relay already running (PID $(cat "$PIDFILE"))"
+    else
+        PYTHON="$(find_python)"
+        if [ -z "$PYTHON" ]; then
+            log "ERROR: no python3 found for relay"
+            logtmp "未找到 python3（relay 需要）"
+            return 1
+        fi
+        if [ ! -f "$RELAY" ]; then
+            log "ERROR: relay script missing: $RELAY"
+            logtmp "relay 脚本缺失：${RELAY}"
+            return 1
+        fi
+        log "starting relay with $PYTHON ..."
+        TRIM_APPDEST="$APPDEST" TRIM_APPNAME="$APPNAME" TRIM_PKGVAR="$PKGVAR" \
+            nohup "$PYTHON" "$RELAY" >> "${PKGVAR}/relay.stdout" 2>&1 &
+        echo $! > "$PIDFILE"
+    fi
+    for _ in $(seq 1 30); do
+        [ -S "$APP_SOCK" ] && break
+        if ! relay_running; then break; fi
+        sleep 0.5
+    done
+    if [ -S "$APP_SOCK" ] && relay_running; then
+        log "started, gateway socket ready: $APP_SOCK (relay PID $(cat "$PIDFILE"))"
+        return 0
+    fi
+    log "ERROR: app.sock not ready after 15s"
+    dump_debug
+    logtmp "app.sock 未就绪，详见 service.log"
+    return 1
+}
+
+stop_service() {
+    log "stopping relay & cockpit.socket ..."
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || true
+    fi
+    pkill -f "${APPDEST}/server/relay.py" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    systemctl stop cockpit.socket cockpit.service >> "$LOGFILE" 2>&1 || true
+    rm -f "$APP_SOCK" "$COCKPIT_SOCK" 2>/dev/null
+    log "stopped"
+    return 0
+}
+
+status_service() {
+    if socket_ready; then
+        log "running (relay PID $(cat "$PIDFILE" 2>/dev/null), cockpit.socket active)"
+        return 0
+    fi
+    log "not running"
+    return 3
+}
+
+case "${1:-}" in
+    start)     start_service ;;
+    stop)      stop_service ;;
+    status)    status_service ;;
+    restart)   stop_service; sleep 1; start_service ;;
+    uninstall) stop_service ;;
+    *)
+        echo "Usage: $0 {start|stop|status|restart|uninstall}" >&2
+        exit 1
+        ;;
+esac
+exit $?

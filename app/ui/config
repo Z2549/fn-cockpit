@@ -1,0 +1,17 @@
+{
+    ".url": {
+        "fn-cockpit.main": {
+            "title": "服务管理 Cockpit",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/fn-cockpit",
+            "gatewaySocket": "app.sock",
+            "url": "/app/fn-cockpit/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}

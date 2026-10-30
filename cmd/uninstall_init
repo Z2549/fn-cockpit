@@ -1,0 +1,33 @@
+#!/bin/bash
+# fn-cockpit - 卸载前：停止 socket、移除 drop-in 与 conf
+# 注意：不卸载 cockpit 系统包；如需彻底移除请手动 apt remove cockpit
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APPNAME}/target}"
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-uninstall.log}"
+
+{
+    echo "[${APPNAME}] uninstall_init: stopping cockpit.socket"
+    systemctl stop cockpit.socket cockpit.service 2>/dev/null || true
+    systemctl disable cockpit.socket 2>/dev/null || true
+
+    rm -f /etc/systemd/system/cockpit.socket.d/fn-cockpit.conf
+    rmdir /etc/systemd/system/cockpit.socket.d 2>/dev/null || true
+
+    # 移除主 cockpit.conf 中的受管段（UrlRoot 等），恢复 cockpit 出厂行为
+    CONF=/etc/cockpit/cockpit.conf
+    if [ -f "$CONF" ]; then
+        sed -i "/^# ${APPNAME}-managed-BEGIN$/,/^# ${APPNAME}-managed-END$/d" "$CONF" 2>/dev/null || true
+        # 受管段删空后若原文件为空且存在备份，则恢复备份
+        if [ -f "${CONF}.fn-cockpit-orig" ] && [ ! -s "$CONF" ]; then
+            mv -f "${CONF}.fn-cockpit-orig" "$CONF" 2>/dev/null || true
+        fi
+    fi
+    rm -f /etc/cockpit/cockpit.conf.d/fn-cockpit.conf
+    rmdir /etc/cockpit/cockpit.conf.d 2>/dev/null || true
+
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "${APPDEST}/app.sock" 2>/dev/null
+
+    echo "[${APPNAME}] uninstall_init: cleaned. cockpit deb package kept; remove with 'apt remove cockpit' if unwanted."
+} >> "$LOG" 2>&1
+exit 0

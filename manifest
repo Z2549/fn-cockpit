@@ -1,0 +1,16 @@
+appname="fn-cockpit"
+version="1.0.0"
+display_name="服务管理 Cockpit"
+desc="基于 Cockpit 的 systemd 服务图形化管理面板：服务启停/开机自启/journal 日志/终端/存储/网络。走飞牛统一应用网关（Unix Socket），不占用任何 TCP 端口，仅登录飞牛的用户可访问。"
+platform="all"
+source="thirdparty"
+
+maintainer="Z2549"
+distributor="Z2549"
+
+ctl_stop="yes"
+checkport="false"
+desktop_uidir="ui"
+desktop_applaunchname="fn-cockpit.main"
+micro_app="true"
+changelog="v1.0.0 正式版：systemd 服务图形化管理（启停/开机自启/journal 日志/终端），走飞牛统一应用网关（Unix Socket）零端口暴露；兼容任意 cockpit 构建（TLS 自动探测）；卸载完整还原系统状态。"

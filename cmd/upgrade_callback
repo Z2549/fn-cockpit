@@ -1,0 +1,40 @@
+#!/bin/bash
+# fn-cockpit - 升级后：APPDEST 可能变化，重新生成 drop-in 与主 conf（与 install_callback 相同逻辑）
+APPNAME="${TRIM_APPNAME:-fn-cockpit}"
+APPDEST="${TRIM_APPDEST:-/var/apps/${APPNAME}/target}"
+PKGVAR="${TRIM_PKGVAR:-/var/apps/${APPNAME}/var}"
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-install.log}"
+GATEWAY_PREFIX="/app/${APPNAME}"
+CONF_BEGIN="# fn-cockpit-managed-BEGIN"
+CONF_END="# fn-cockpit-managed-END"
+
+{
+    mkdir -p "$PKGVAR" /etc/systemd/system/cockpit.socket.d /etc/cockpit
+    cat > /etc/systemd/system/cockpit.socket.d/fn-cockpit.conf <<EOF
+# Managed by fn-cockpit fpk. Do NOT edit by hand; reinstall or edit then: systemctl daemon-reload
+[Socket]
+ListenStream=
+ListenStream=${APPDEST}/cockpit.sock
+SocketMode=0666
+EOF
+    CONF=/etc/cockpit/cockpit.conf
+    [ -f "$CONF" ] || : > "$CONF"
+    [ -f "${CONF}.fn-cockpit-orig" ] || cp -n "$CONF" "${CONF}.fn-cockpit-orig" 2>/dev/null || true
+    sed -i "/^${CONF_BEGIN}$/,/^${CONF_END}$/d" "$CONF" 2>/dev/null || true
+    cat >> "$CONF" <<EOF
+${CONF_BEGIN}
+[WebService]
+UrlRoot = ${GATEWAY_PREFIX}
+LoginTitle = ${APPNAME}
+ProtocolHeader = X-Forwarded-Proto
+ForwardedForHeader = X-Forwarded-For
+AllowUnencrypted = true
+# v0.1.7 起 relay 会把 Origin 重写为 https://<Host>，一般无需再配 Origins
+# Origins = https://192.168.31.182:5667
+${CONF_END}
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "${APPDEST}/app.sock" "${APPDEST}/cockpit.sock" 2>/dev/null
+    echo "[${APPNAME}] upgrade_callback: drop-in/conf regenerated for ${APPDEST}"
+} >> "$LOG" 2>&1
+exit 0

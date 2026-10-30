@@ -1,0 +1,13 @@
+# fpk build artifacts
+*.fpk
+*.tgz
+
+# runtime logs / sockets
+*.log
+*.sock
+*.pid
+relay.stdout
+
+# OS junk
+Thumbs.db
+.DS_Store
