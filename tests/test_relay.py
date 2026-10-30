@@ -57,10 +57,27 @@ threading.Thread(target=backend_server, daemon=True).start()
 
 env = dict(os.environ)
 env["RELAY_TCP_PORT"] = str(PORT)
-relay = subprocess.Popen([sys.executable,
-    r"C:\Users\ZJY\WorkBuddy\2026-10-30-23-07-06\native-ui-application-sample\app\server\relay.py"],
+# 相对本文件解析 relay.py 路径，Windows / Linux 通用
+RELAY_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "app", "server", "relay.py")
+relay = subprocess.Popen([sys.executable, RELAY_PY],
     env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-time.sleep(0.8)
+
+def wait_relay(timeout=8.0):
+    """轮询直到 relay 开始监听；若子进程提前退出则立即转储其输出便于排障。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if relay.poll() is not None:
+            out = relay.stdout.read().decode(errors="replace") if relay.stdout else ""
+            raise SystemExit(f"[T] relay exited early (code {relay.returncode}):\n{out[-1500:]}")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.connect(LISTEN_EP); probe.close(); return
+        except OSError:
+            probe.close(); time.sleep(0.1)
+    raise SystemExit("[T] relay did not start listening in time")
+
+wait_relay()
 print("[T] relay up")
 
 def client_req(method, path, body=b"", ws=False):
